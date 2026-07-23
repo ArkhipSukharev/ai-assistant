@@ -1,0 +1,11 @@
+backend/.env
+.env
+frontend/web-chat/.env
+backend/__pycache__/
+backend/.pytest_cache/
+backend/.venv/
+backend/*.db
+frontend/web-chat/node_modules/
+frontend/web-chat/dist/
+*.pyc
+.DS_Store

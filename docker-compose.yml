@@ -1,0 +1,121 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: f5_assistant
+      POSTGRES_USER: f5_assistant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-f5-local-postgres-2026}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U f5_assistant -d f5_assistant"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend:
+    restart: unless-stopped
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://f5_assistant:${POSTGRES_PASSWORD:-f5-local-postgres-2026}@postgres:5432/f5_assistant
+      DATABASE_AUTO_CREATE: "false"
+      REDIS_URL: redis://redis:6379/0
+      SESSION_STORE_REQUIRE_REDIS: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  frontend:
+    restart: unless-stopped
+    build:
+      context: ./frontend/web-chat
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres-backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-f5-local-postgres-2026}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - postgres_backups:/backups
+    command: >
+      sh -c "while true; do
+      pg_dump -h postgres -U f5_assistant -d f5_assistant
+      --format=custom --file=/backups/f5_assistant_$$(date +%Y%m%d_%H%M%S).dump &&
+      find /backups -type f -mtime +7 -delete;
+      sleep 86400;
+      done"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+  postgres_backups:
+  redis_data:
