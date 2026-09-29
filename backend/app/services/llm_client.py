@@ -10,15 +10,15 @@ from app.config import Settings
 logger = logging.getLogger(__name__)
 
 
-class F5AIClient:
+class LLMClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._base_url = settings.f5ai_base_url.rstrip("/")
+        self._base_url = settings.llm_base_url.rstrip("/")
 
     @property
     def _headers(self) -> dict[str, str]:
         return {
-            "X-Auth-Token": self._settings.f5ai_api_key,
+            "X-Auth-Token": self._settings.llm_api_key,
             "Content-Type": "application/json",
         }
 
@@ -33,7 +33,7 @@ class F5AIClient:
         max_tokens: int = 4096,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "model": model or self._settings.f5ai_model,
+            "model": model or self._settings.llm_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -51,12 +51,12 @@ class F5AIClient:
             )
             if response.is_error:
                 logger.error(
-                    "F5AI chat error %s: %s",
+                    "LLM chat error %s: %s",
                     response.status_code,
                     response.text[:1500],
                 )
                 raise RuntimeError(
-                    f"F5AI отклонил запрос (HTTP {response.status_code})"
+                    f"LLM отклонил запрос (HTTP {response.status_code})"
                 )
             return response.json()
 

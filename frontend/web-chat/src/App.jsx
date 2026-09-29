@@ -41,6 +41,16 @@ function cleanMessageText(content = "") {
     .trim();
 }
 
+function splitMessageText(content = "", extractSource = true) {
+  const lines = cleanMessageText(content).split("\n");
+  if (!extractSource) return { body: lines.join("\n").trim(), source: "" };
+  const sourceLines = lines.filter((line) => /^Источник:\s*amoCRM\b/i.test(line.trim()));
+  return {
+    body: lines.filter((line) => !/^Источник:\s*amoCRM\b/i.test(line.trim())).join("\n").trim(),
+    source: sourceLines.join(" ").trim(),
+  };
+}
+
 function formatMessageDate(value) {
   if (!value) return "";
   return new Intl.DateTimeFormat("ru-RU", {
@@ -283,8 +293,8 @@ function Login({ onLogin }) {
   return (
     <div className="login-page">
       <form className="login-card" onSubmit={submit}>
-        <div className="brand-mark">F5</div>
-        <h1>F5 Assistant</h1>
+        <div className="brand-mark">AI</div>
+        <h1>AI Assistant</h1>
         <p>Войдите в корпоративный аккаунт</p>
         <label>
           Логин
@@ -472,7 +482,7 @@ function Chat({
             onClick={() => setModelMenuOpen((open) => !open)}
             disabled={modelSaving}
           >
-            <strong>F5 Assistant</strong>
+            <strong>AI Assistant</strong>
             <span>{currentModel?.name || selectedModel}</span>
             <i>⌄</i>
           </button>
@@ -524,7 +534,7 @@ function Chat({
       <main className={`conversation ${messages.length ? "" : "empty"}`}>
         {!messages.length && !loadingHistory && (
           <div className="welcome">
-            <div className="assistant-logo">F5</div>
+            <div className="assistant-logo">AI</div>
             <h1>Чем могу помочь?</h1>
             <p>Задайте вопрос по сделкам, задачам или показателям вашей amoCRM</p>
             <div className="suggestions">
@@ -538,10 +548,15 @@ function Chat({
         )}
         {messages.map((message, index) => (
           <article key={index} className={`message-row ${message.role}`}>
-            {message.role === "assistant" && <div className="message-avatar">F5</div>}
+            {message.role === "assistant" && <div className="message-avatar">AI</div>}
             <div className="message-content">
-              <div>{cleanMessageText(message.content)}</div>
+              <div>{splitMessageText(message.content, message.role === "assistant").body}</div>
               <MessageAttachments attachments={message.attachments} />
+              {splitMessageText(message.content, message.role === "assistant").source && (
+                <small className="message-source">
+                  {splitMessageText(message.content, true).source}
+                </small>
+              )}
               {message.created_at && (
                 <time className="message-time" dateTime={message.created_at}>
                   {formatMessageDate(message.created_at)} МСК
@@ -576,13 +591,13 @@ function Chat({
         ))}
         {loading && (
           <article className="message-row assistant">
-            <div className="message-avatar">F5</div>
+            <div className="message-avatar">AI</div>
             <div className="thinking"><i></i><i></i><i></i></div>
           </article>
         )}
         {loadingHistory && (
           <article className="message-row assistant">
-            <div className="message-avatar">F5</div>
+            <div className="message-avatar">AI</div>
             <div className="thinking"><i></i><i></i><i></i></div>
           </article>
         )}
@@ -601,7 +616,7 @@ function Chat({
                 e.currentTarget.form?.requestSubmit();
               }
             }}
-            placeholder="Сообщить F5 Assistant"
+            placeholder="Сообщить AI Assistant"
             disabled={loading || loadingHistory}
           />
           <button className="send-button" disabled={loading || loadingHistory || !input.trim()} title="Отправить">↑</button>
@@ -614,18 +629,25 @@ function Chat({
 
 const emptyForm = {
   name: "", email: "", password: "", role: "user", telegram_id: "",
+  amocrm_user_id: "",
   request_limit_per_day: 50, is_active: true,
 };
 
 function Users() {
   const [users, setUsers] = useState([]);
+  const [managers, setManagers] = useState([]);
   const [form, setForm] = useState(emptyForm);
   const [editingId, setEditingId] = useState(null);
   const [error, setError] = useState("");
 
   async function load() {
     try {
-      setUsers(await api("/api/admin/users"));
+      const [accounts, crmManagers] = await Promise.all([
+        api("/api/admin/users"),
+        api("/api/admin/amocrm/managers"),
+      ]);
+      setUsers(accounts);
+      setManagers(crmManagers);
     } catch (err) {
       setError(err.message);
     }
@@ -641,6 +663,7 @@ function Users() {
       password: "",
       role: user.role,
       telegram_id: user.telegram_id ?? "",
+      amocrm_user_id: user.amocrm_user_id ?? "",
       request_limit_per_day: user.request_limit_per_day,
       is_active: user.is_active,
     });
@@ -652,6 +675,7 @@ function Users() {
     const payload = {
       ...form,
       telegram_id: form.telegram_id === "" ? null : Number(form.telegram_id),
+      amocrm_user_id: form.amocrm_user_id === "" ? null : Number(form.amocrm_user_id),
       request_limit_per_day: Number(form.request_limit_per_day),
     };
     if (editingId && !payload.password) delete payload.password;
@@ -677,6 +701,7 @@ function Users() {
             <button key={user.id} className="user-row" onClick={() => edit(user)}>
               <span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span>
               <span className="user-main"><strong>{user.name}</strong><small>{user.email}</small></span>
+              <span className="manager-link">{managers.find((manager) => manager.id === user.amocrm_user_id)?.name || "amoCRM не привязан"}</span>
               <span className={`badge ${user.is_active ? "active" : "blocked"}`}>{user.is_active ? "Активен" : "Отключён"}</span>
               <span className="role">{user.role === "admin" ? "Администратор" : "Пользователь"}</span>
             </button>
@@ -696,6 +721,14 @@ function Users() {
           <label>Лимит в день<input type="number" min="1" max="10000" value={form.request_limit_per_day} onChange={(e) => setForm({ ...form, request_limit_per_day: e.target.value })} /></label>
         </div>
         <label>Telegram ID<input type="number" value={form.telegram_id} onChange={(e) => setForm({ ...form, telegram_id: e.target.value })} placeholder="Например, 123456789" /></label>
+        <label>Менеджер amoCRM
+          <select value={form.amocrm_user_id} onChange={(e) => setForm({ ...form, amocrm_user_id: e.target.value })}>
+            <option value="">Не привязан</option>
+            {managers.map((manager) => (
+              <option key={manager.id} value={manager.id}>{manager.name}{manager.email ? ` · ${manager.email}` : ""}</option>
+            ))}
+          </select>
+        </label>
         {editingId && <label className="checkbox"><input type="checkbox" checked={form.is_active} onChange={(e) => setForm({ ...form, is_active: e.target.checked })} /> Аккаунт активен</label>}
         {error && <div className="alert error">{error}</div>}
         <div className="form-actions">
@@ -766,7 +799,7 @@ function ModelSettings({ onModelChange }) {
       </div>
       <div className="settings-section">
         <div className="settings-copy">
-          <h2>Модель F5AI</h2>
+          <h2>Модель</h2>
           <p>Эта модель будет использоваться в веб-чате и Telegram-боте для всех сотрудников.</p>
         </div>
         <div className="model-list">
@@ -793,9 +826,9 @@ function ModelSettings({ onModelChange }) {
         </div>
       </div>
 
-      {!settings.f5ai_configured && (
+      {!settings.llm_configured && (
         <div className="settings-notice">
-          <strong>F5AI пока не подключён</strong>
+          <strong>Модель пока не подключена</strong>
           <span>Модель можно выбрать заранее. Запросы начнут работать после добавления API-ключа.</span>
         </div>
       )}
@@ -1451,17 +1484,20 @@ function QuickActionsSettings() {
 
 function AmoCRMIntegrationSettings() {
   const [status, setStatus] = useState(null);
+  const [metrics, setMetrics] = useState(null);
   const [insights, setInsights] = useState([]);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function load() {
     try {
-      const [statusData, insightData] = await Promise.all([
-        api("/api/admin/amocrm/status"),
+      const [statusData, metricsData, insightData] = await Promise.all([
+        api("/api/admin/amocrm/status").catch((err) => ({ message: err.message })),
+        api("/api/admin/amocrm/metrics"),
         api("/api/admin/amocrm/insights?limit=50"),
       ]);
       setStatus(statusData);
+      setMetrics(metricsData);
       setInsights(insightData);
     } catch (err) {
       setMessage(err.message);
@@ -1501,6 +1537,14 @@ function AmoCRMIntegrationSettings() {
           <div><strong>Webhooks</strong><small>{status?.registered ? "Подключены и принимают изменения" : status?.message || "Не зарегистрированы"}</small></div>
           <button className="secondary" onClick={() => run("register")} disabled={busy || !status?.configured}>Подключить</button>
         </article>
+        <article>
+          <strong>{metrics?.requests_today || 0}</strong>
+          <span>API-запросов сегодня · очередь {metrics?.queue_size || 0}</span>
+        </article>
+        <article>
+          <strong>{metrics?.circuit_open ? "Пауза" : "Работает"}</strong>
+          <span>{metrics?.circuit_open ? `${metrics.circuit_reason}, ${metrics.circuit_seconds} сек.` : "Защита API активна"}</span>
+        </article>
         <article><strong>{insights.length}</strong><span>сделок требуют внимания</span></article>
         <article><strong>{highRisk}</strong><span>с высоким риском</span></article>
       </div>
@@ -1536,14 +1580,14 @@ function SettingsHub({ isAdmin, onModelChange, onLogout }) {
       <header className="settings-header">
         <div>
           <h1>Настройки</h1>
-          <p>Управление рабочим пространством F5 Assistant</p>
+          <p>Управление рабочим пространством AI Assistant</p>
         </div>
         <button className="logout-button" onClick={onLogout}>Выйти</button>
       </header>
       <div className="settings-layout">
         <nav className="settings-nav">
           <button className={tab === "model" ? "selected" : ""} onClick={() => setTab("model")}>
-            <span>◇</span><div><strong>Модель</strong><small>Настройки F5AI</small></div>
+            <span>◇</span><div><strong>Модель</strong><small>Настройки модели</small></div>
           </button>
           <button className={tab === "quick" ? "selected" : ""} onClick={() => setTab("quick")}>
             <span>⚡</span><div><strong>Быстрые кнопки</strong><small>Персональные запросы</small></div>
@@ -1711,7 +1755,7 @@ export default function App() {
   return (
     <div className="shell">
       <aside className="sidebar">
-        <div className="logo"><span>F5</span><div><strong>F5 Assistant</strong><small>amoCRM analytics</small></div></div>
+        <div className="logo"><span>AI</span><div><strong>AI Assistant</strong><small>amoCRM analytics</small></div></div>
         <nav>
           <button className={`new-chat ${page === "chat" && !activeConversationId ? "selected" : ""}`} onClick={newChat}><span>＋</span> Новый чат</button>
         </nav>

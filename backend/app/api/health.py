@@ -16,7 +16,7 @@ async def health(request: Request) -> HealthResponse:
     database_connected = await database.ping() if database else False
     return HealthResponse(
         status="ok" if database_connected else "degraded",
-        f5ai_configured=bool(settings.f5ai_api_key),
+        llm_configured=bool(settings.llm_api_key),
         amocrm_configured=settings.amocrm_configured,
         telegram_configured=bool(settings.telegram_bot_token),
         redis_connected=redis_connected,

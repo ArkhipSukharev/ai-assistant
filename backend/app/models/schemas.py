@@ -28,7 +28,7 @@ class ChatResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    f5ai_configured: bool
+    llm_configured: bool
     amocrm_configured: bool
     telegram_configured: bool
     redis_connected: bool
@@ -52,6 +52,7 @@ class UserResponse(BaseModel):
     email: str
     role: str
     telegram_id: int | None
+    amocrm_user_id: int | None
     is_active: bool
     request_limit_per_day: int
     requests_today: int
@@ -64,6 +65,7 @@ class CreateUserRequest(BaseModel):
     password: str = Field(..., min_length=10, max_length=256)
     role: Literal["admin", "user"] = "user"
     telegram_id: int | None = None
+    amocrm_user_id: int | None = None
     request_limit_per_day: int = Field(default=50, ge=1, le=10000)
 
 
@@ -73,6 +75,7 @@ class UpdateUserRequest(BaseModel):
     password: str | None = Field(default=None, min_length=10, max_length=256)
     role: Literal["admin", "user"] | None = None
     telegram_id: int | None = None
+    amocrm_user_id: int | None = None
     is_active: bool | None = None
     request_limit_per_day: int | None = Field(default=None, ge=1, le=10000)
 
@@ -99,7 +102,7 @@ class ModelOption(BaseModel):
 class AdminSettingsResponse(BaseModel):
     selected_model: str
     available_models: list[ModelOption]
-    f5ai_configured: bool
+    llm_configured: bool
 
 
 class UpdateAdminSettingsRequest(BaseModel):

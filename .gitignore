@@ -1,4 +1,5 @@
 backend/.env
+backend/.pytest-tmp*/
 .env
 frontend/web-chat/.env
 backend/__pycache__/

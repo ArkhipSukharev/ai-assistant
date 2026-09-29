@@ -136,6 +136,7 @@ class AuthService:
         role: str,
         telegram_id: int | None,
         request_limit_per_day: int,
+        amocrm_user_id: int | None = None,
     ) -> User:
         if role not in {"admin", "user"}:
             raise ValueError("Недопустимая роль")
@@ -146,6 +147,7 @@ class AuthService:
                 password_hash=self.hash_password(password),
                 role=role,
                 telegram_id=telegram_id,
+                amocrm_user_id=amocrm_user_id,
                 request_limit_per_day=request_limit_per_day,
             )
             session.add(user)
@@ -173,6 +175,7 @@ class AuthService:
                 "email",
                 "role",
                 "telegram_id",
+                "amocrm_user_id",
                 "is_active",
                 "request_limit_per_day",
             ):

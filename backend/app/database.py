@@ -35,6 +35,9 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default="user")
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True, index=True)
+    amocrm_user_id: Mapped[int | None] = mapped_column(
+        BigInteger, unique=True, nullable=True, index=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     request_limit_per_day: Mapped[int] = mapped_column(Integer, default=50)
     requests_today: Mapped[int] = mapped_column(Integer, default=0)
@@ -248,6 +251,18 @@ class DealInsight(Base):
     analyzed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
+
+
+class AmoCRMSnapshot(Base):
+    __tablename__ = "amocrm_snapshots"
+
+    entity_type: Mapped[str] = mapped_column(String(40), primary_key=True)
+    entity_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    data: Mapped[dict | list] = mapped_column(JSON)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class Database:

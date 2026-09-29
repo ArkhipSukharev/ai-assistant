@@ -13,7 +13,7 @@ def builder() -> ReportBuilder:
 def test_sales_report_summary(builder: ReportBuilder) -> None:
     leads = [
         {"id": 1, "price": 1000, "status_id": 10, "pipeline_id": 1, "responsible_user_id": 1, "created_at": 1700000000},
-        {"id": 2, "price": 2000, "status_id": 11, "pipeline_id": 1, "responsible_user_id": 2, "created_at": 1700001000},
+        {"id": 2, "price": 2000, "status_id": 142, "pipeline_id": 1, "responsible_user_id": 2, "created_at": 1700001000},
     ]
     pipelines = [
         {
@@ -22,7 +22,7 @@ def test_sales_report_summary(builder: ReportBuilder) -> None:
             "_embedded": {
                 "statuses": [
                     {"id": 10, "name": "New", "type": 0},
-                    {"id": 11, "name": "Won", "type": 142},
+                    {"id": 142, "name": "Won", "type": 1},
                 ]
             },
         }

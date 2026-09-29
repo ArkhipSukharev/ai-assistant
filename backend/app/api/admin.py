@@ -123,9 +123,9 @@ async def get_settings(
     return AdminSettingsResponse(
         selected_model=await service.get_model(),
         available_models=await service.available_models(),
-        f5ai_configured=bool(
-            service.settings.f5ai_api_key
-            and service.settings.f5ai_api_key != "sk-f5ai-..."
+        llm_configured=bool(
+            service.settings.llm_api_key
+            and service.settings.llm_api_key != "sk-llm-..."
         ),
     )
 
@@ -143,9 +143,9 @@ async def update_settings(
     return AdminSettingsResponse(
         selected_model=selected_model,
         available_models=await service.available_models(),
-        f5ai_configured=bool(
-            service.settings.f5ai_api_key
-            and service.settings.f5ai_api_key != "sk-f5ai-..."
+        llm_configured=bool(
+            service.settings.llm_api_key
+            and service.settings.llm_api_key != "sk-llm-..."
         ),
     )
 

@@ -10,7 +10,7 @@ from app.config import Settings
 from app.database import Database
 from app.services.app_settings import AppSettingsService
 from app.services.auth_service import AuthService
-from app.services.f5ai_client import F5AIClient
+from app.services.llm_client import LLMClient
 from app.services.telegram_proxy import TelegramProxyService
 
 
@@ -30,7 +30,7 @@ def test_login_cookie_and_admin_users_api(tmp_path) -> None:
     app = FastAPI()
     app.state.auth_service = auth
     app.state.app_settings_service = AppSettingsService(
-        database, settings, F5AIClient(settings)
+        database, settings, LLMClient(settings)
     )
     proxy_service = TelegramProxyService(database, settings)
     app.state.telegram_proxy_service = proxy_service
@@ -59,11 +59,13 @@ def test_login_cookie_and_admin_users_api(tmp_path) -> None:
                 "password": "very-secure-sales-password",
                 "role": "user",
                 "telegram_id": 111222333,
+                "amocrm_user_id": 555666,
                 "request_limit_per_day": 25,
             },
         )
         assert created.status_code == 201
         assert created.json()["telegram_id"] == 111222333
+        assert created.json()["amocrm_user_id"] == 555666
         assert len(client.get("/api/admin/users").json()) == 2
 
         model_settings = client.get("/api/admin/settings")

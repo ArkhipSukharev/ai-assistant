@@ -1,4 +1,4 @@
-"""Create the initial F5 Assistant schema.
+"""Create the initial AI Assistant schema.
 
 Revision ID: 20260723_0001
 Revises:

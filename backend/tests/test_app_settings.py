@@ -4,7 +4,7 @@ from app.config import Settings
 from app.database import Database
 from app.services.app_settings import AppSettingsService
 from app.services.auth_service import AuthService
-from app.services.f5ai_client import F5AIClient
+from app.services.llm_client import LLMClient
 
 
 def test_model_setting_is_persisted(tmp_path) -> None:
@@ -14,8 +14,8 @@ def test_model_setting_is_persisted(tmp_path) -> None:
         )
         settings = Settings(
             _env_file=None,
-            f5ai_api_key="",
-            f5ai_model="gpt-4.1-mini",
+            llm_api_key="",
+            llm_model="gpt-4.1-mini",
             admin_email="admin@example.com",
             admin_password="very-secure-admin-password",
         )
@@ -33,7 +33,7 @@ def test_model_setting_is_persisted(tmp_path) -> None:
             request_limit_per_day=50,
         )
 
-        service = AppSettingsService(database, settings, F5AIClient(settings))
+        service = AppSettingsService(database, settings, LLMClient(settings))
         assert await service.get_model() == "gpt-4.1-mini"
         assert len(await service.available_models()) >= 2
 

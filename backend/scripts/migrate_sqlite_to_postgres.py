@@ -87,13 +87,13 @@ def main() -> None:
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     password = os.getenv("POSTGRES_PASSWORD", "")
     default_postgres_url = (
-        f"postgresql+asyncpg://f5_assistant:{quote_plus(password)}"
-        "@localhost:5432/f5_assistant"
+        f"postgresql+asyncpg://ai_assistant:{quote_plus(password)}"
+        "@localhost:5432/ai_assistant"
         if password
         else None
     )
     parser = argparse.ArgumentParser(
-        description="Copy all F5 Assistant application data from SQLite to PostgreSQL."
+        description="Copy all AI Assistant application data from SQLite to PostgreSQL."
     )
     parser.add_argument(
         "--sqlite-url",

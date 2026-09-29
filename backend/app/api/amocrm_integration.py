@@ -47,6 +47,25 @@ async def get_amocrm_status(
         raise HTTPException(status_code=502, detail=f"amoCRM API error: {exc}") from exc
 
 
+@router.get("/api/admin/amocrm/metrics")
+async def get_amocrm_metrics(
+    _: User = Depends(require_admin),
+    service: AmoCRMInsightService = Depends(get_insight_service),
+) -> dict:
+    return await service.api_metrics()
+
+
+@router.get("/api/admin/amocrm/managers")
+async def list_amocrm_managers(
+    _: User = Depends(require_admin),
+    service: AmoCRMInsightService = Depends(get_insight_service),
+) -> list[dict]:
+    try:
+        return await service.list_managers()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"amoCRM API error: {exc}") from exc
+
+
 @router.post("/api/admin/amocrm/webhook/register")
 async def register_amocrm_webhook(
     _: User = Depends(require_admin),

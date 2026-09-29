@@ -18,7 +18,7 @@ class FakeAmoCRM:
     def entity_url(self, entity, entity_id):
         return f"https://example.amocrm.ru/{entity}/{entity_id}"
 
-    async def get_lead_full_details(self, lead_id):
+    async def get_lead_full_details(self, lead_id, *, lightweight=False):
         old = int((datetime.now(timezone.utc) - timedelta(days=12)).timestamp())
         return {
             "lead": {

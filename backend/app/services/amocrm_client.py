@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from copy import deepcopy
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import httpx
 
 from app.config import Settings
+from app.services.amocrm_coordinator import (
+    AmoCRMCircuitOpen,
+    AmoCRMRequestCoordinator,
+)
+
+if TYPE_CHECKING:
+    from app.services.amocrm_snapshot import AmoCRMSnapshotStore
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +41,119 @@ class AmoCRMClient:
     PAGE_LIMIT = 250
     MAX_RETRIES = 3
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        snapshot_store: AmoCRMSnapshotStore | None = None,
+    ) -> None:
         self._settings = settings
         self._access_token = settings.amocrm_access_token
         self._domain = settings.amocrm_domain.rstrip("/")
+        self._client = httpx.AsyncClient(timeout=60.0)
+        self._coordinator = AmoCRMRequestCoordinator(settings)
+        self._snapshot_store = snapshot_store
+        self._cache: dict[str, tuple[float, Any]] = {}
+        self._cache_locks: dict[str, asyncio.Lock] = {}
+
+    async def start(self) -> None:
+        await self._coordinator.start()
+
+    async def close(self) -> None:
+        await self._coordinator.close()
+        await self._client.aclose()
+
+    def priority(self, value: int):
+        return self._coordinator.priority(value)
+
+    def request_budget(self, limit: int):
+        return self._coordinator.request_budget(limit)
+
+    async def coordinator_metrics(self) -> dict[str, Any]:
+        return await self._coordinator.metrics()
+
+    async def invalidate_entity(self, entity_type: str, entity_id: int) -> None:
+        self._cache.pop(f"{entity_type}:{entity_id}", None)
+        if self._snapshot_store:
+            await self._snapshot_store.invalidate(entity_type, entity_id)
+        paths = {
+            "lead": (
+                f"/api/v4/leads/{entity_id}",
+                {"with": "contacts,loss_reason,catalog_elements,source_id"},
+            ),
+            "contact": (
+                f"/api/v4/contacts/{entity_id}",
+                {"with": "leads,customers,catalog_elements"},
+            ),
+            "company": (
+                f"/api/v4/companies/{entity_id}",
+                {"with": "contacts,leads,customers,catalog_elements"},
+            ),
+        }
+        target = paths.get(entity_type)
+        if target:
+            path, params = target
+            key = json.dumps(
+                ["GET", path, sorted(params.items())],
+                ensure_ascii=False,
+                default=str,
+            )
+            await self._coordinator.invalidate_cache(key)
+
+    async def _cached(
+        self,
+        key: str,
+        ttl_seconds: int,
+        loader: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        now = asyncio.get_running_loop().time()
+        cached = self._cache.get(key)
+        if cached and now - cached[0] < ttl_seconds:
+            return deepcopy(cached[1])
+        lock = self._cache_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            now = asyncio.get_running_loop().time()
+            cached = self._cache.get(key)
+            if cached and now - cached[0] < ttl_seconds:
+                return deepcopy(cached[1])
+            value = await loader()
+            self._cache[key] = (now, deepcopy(value))
+            return value
+
+    async def _snapshot_cached(
+        self,
+        entity_type: str,
+        entity_id: int,
+        ttl_seconds: int,
+        loader: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        if not self._snapshot_store:
+            return await loader()
+        snapshot = await self._snapshot_store.get(entity_type, entity_id)
+        if snapshot is not None:
+            return snapshot
+        try:
+            value = await loader()
+        except Exception:
+            stale = await self._snapshot_store.get(
+                entity_type,
+                entity_id,
+                allow_stale=True,
+            )
+            if stale is not None:
+                logger.warning(
+                    "Serving stale PostgreSQL snapshot for %s:%s",
+                    entity_type,
+                    entity_id,
+                )
+                return stale
+            raise
+        await self._snapshot_store.put(
+            entity_type,
+            entity_id,
+            value,
+            ttl_seconds=ttl_seconds,
+        )
+        return value
 
     @property
     def base_url(self) -> str:
@@ -69,35 +187,94 @@ class AmoCRMClient:
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         last_error: Exception | None = None
+        cache_key = json.dumps(
+            [method, path, sorted((params or {}).items())],
+            ensure_ascii=False,
+            default=str,
+        )
+        cache_seconds = self._cache_seconds(method, path)
+        if cache_seconds:
+            cached = await self._coordinator.get_cache(cache_key)
+            if cached is not None:
+                return cached
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    response = await client.request(
+                response = await self._coordinator.execute(
+                    path,
+                    lambda: self._client.request(
                         method,
                         url,
                         headers=self._headers,
                         params=params,
                         json=json_data,
+                    ),
+                )
+                await self._coordinator.record(path, response.status_code)
+
+                if response.status_code == 401 and self._settings.amocrm_refresh_token:
+                    await self._refresh_access_token()
+                    continue
+
+                response.raise_for_status()
+                if response.status_code == 204 or not response.content:
+                    return {}
+                result = response.json()
+                if cache_seconds:
+                    await self._coordinator.set_cache(
+                        cache_key,
+                        result,
+                        fresh_seconds=cache_seconds,
+                        stale_seconds=self._settings.amocrm_stale_cache_seconds,
                     )
+                return result
 
-                    if response.status_code == 401 and self._settings.amocrm_refresh_token:
-                        await self._refresh_access_token()
-                        continue
-
-                    if response.status_code == 429:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-
-                    response.raise_for_status()
-                    if response.status_code == 204 or not response.content:
-                        return {}
-                    return response.json()
             except httpx.HTTPStatusError as exc:
                 last_error = exc
-                if exc.response.status_code in {429, 500, 502, 503, 504}:
-                    await asyncio.sleep(2 ** attempt)
+                if exc.response.status_code == 429:
+                    await self._coordinator.open_circuit(
+                        self._settings.amocrm_circuit_429_seconds,
+                        "amoCRM вернул 429",
+                    )
+                elif exc.response.status_code == 403:
+                    await self._coordinator.open_circuit(
+                        self._settings.amocrm_circuit_403_seconds,
+                        "amoCRM вернул 403",
+                    )
+                if exc.response.status_code in {403, 429, 500, 502, 503, 504}:
+                    if cache_seconds:
+                        stale = await self._coordinator.get_cache(
+                            cache_key,
+                            allow_stale=True,
+                        )
+                        if stale is not None:
+                            logger.warning(
+                                "Serving stale amoCRM cache for %s after %s",
+                                path,
+                                exc.response.status_code,
+                            )
+                            return stale
+                    retry_after = exc.response.headers.get("Retry-After")
+                    delay = (
+                        float(retry_after)
+                        if retry_after and retry_after.replace(".", "", 1).isdigit()
+                        else 2 ** (attempt + 1)
+                    )
+                    await asyncio.sleep(min(max(delay, 1), 30))
                     continue
+                raise
+            except AmoCRMCircuitOpen:
+                if cache_seconds:
+                    stale = await self._coordinator.get_cache(
+                        cache_key,
+                        allow_stale=True,
+                    )
+                    if stale is not None:
+                        logger.warning(
+                            "Serving stale amoCRM cache for %s while circuit is open",
+                            path,
+                        )
+                        return stale
                 raise
             except httpx.RequestError as exc:
                 last_error = exc
@@ -106,6 +283,18 @@ class AmoCRMClient:
         if last_error:
             raise last_error
         return {}
+
+    def _cache_seconds(self, method: str, path: str) -> int:
+        if method != "GET" or path == "/api/v4/webhooks":
+            return 0
+        if path in {"/api/v4/users", "/api/v4/leads/pipelines"}:
+            return self._settings.amocrm_static_cache_seconds
+        if any(
+            marker in path
+            for marker in ("/notes", "/events", "/tasks", "/contacts/", "/companies/")
+        ):
+            return self._settings.amocrm_entity_cache_seconds
+        return self._settings.amocrm_query_cache_seconds
 
     async def get_webhooks(self) -> list[dict[str, Any]]:
         data = await self._request("GET", "/api/v4/webhooks")
@@ -184,6 +373,7 @@ class AmoCRMClient:
         date_field: str = "created_at",
         pipeline_id: int | None = None,
         manager_id: int | None = None,
+        manager_ids: list[int] | None = None,
         query: str | None = None,
         with_contacts: bool = True,
         max_items: int | None = None,
@@ -197,37 +387,90 @@ class AmoCRMClient:
             params["filter[pipeline_id]"] = pipeline_id
         if manager_id:
             params["filter[responsible_user_id]"] = manager_id
+        elif manager_ids:
+            params["filter[responsible_user_id][]"] = manager_ids
         if query:
             params["query"] = query
         if with_contacts:
             params["with"] = "contacts"
 
-        return await self._paginate(
+        leads = await self._paginate(
             "/api/v4/leads",
             params=params,
             embedded_key="leads",
             max_items=max_items,
         )
+        if date_from or date_to:
+            from_timestamp = date_to_timestamp(date_from) if date_from else None
+            to_timestamp = (
+                date_to_timestamp(date_to, end_of_day=True) if date_to else None
+            )
+
+            def in_period(lead: dict[str, Any]) -> bool:
+                value = lead.get(date_field)
+                if not isinstance(value, (int, float)):
+                    return False
+                return (
+                    (from_timestamp is None or value >= from_timestamp)
+                    and (to_timestamp is None or value <= to_timestamp)
+                )
+
+            leads = [lead for lead in leads if in_period(lead)]
+        if manager_ids:
+            allowed_manager_ids = {int(value) for value in manager_ids}
+            leads = [
+                lead
+                for lead in leads
+                if lead.get("responsible_user_id") in allowed_manager_ids
+            ]
+        return leads
 
     async def get_lead(self, lead_id: int) -> dict[str, Any]:
-        return await self._request(
-            "GET",
-            f"/api/v4/leads/{lead_id}",
-            params={"with": "contacts,loss_reason,catalog_elements,source_id"},
+        return await self._cached(
+            f"lead:{lead_id}",
+            self._settings.amocrm_entity_cache_seconds,
+            lambda: self._snapshot_cached(
+                "lead",
+                lead_id,
+                self._settings.amocrm_entity_cache_seconds,
+                lambda: self._request(
+                    "GET",
+                    f"/api/v4/leads/{lead_id}",
+                    params={"with": "contacts,loss_reason,catalog_elements,source_id"},
+                ),
+            ),
         )
 
     async def get_contact(self, contact_id: int) -> dict[str, Any]:
-        return await self._request(
-            "GET",
-            f"/api/v4/contacts/{contact_id}",
-            params={"with": "leads,customers,catalog_elements"},
+        return await self._cached(
+            f"contact:{contact_id}",
+            self._settings.amocrm_entity_cache_seconds,
+            lambda: self._snapshot_cached(
+                "contact",
+                contact_id,
+                self._settings.amocrm_entity_cache_seconds,
+                lambda: self._request(
+                    "GET",
+                    f"/api/v4/contacts/{contact_id}",
+                    params={"with": "leads,customers,catalog_elements"},
+                ),
+            ),
         )
 
     async def get_company(self, company_id: int) -> dict[str, Any]:
-        return await self._request(
-            "GET",
-            f"/api/v4/companies/{company_id}",
-            params={"with": "contacts,leads,customers,catalog_elements"},
+        return await self._cached(
+            f"company:{company_id}",
+            self._settings.amocrm_entity_cache_seconds,
+            lambda: self._snapshot_cached(
+                "company",
+                company_id,
+                self._settings.amocrm_entity_cache_seconds,
+                lambda: self._request(
+                    "GET",
+                    f"/api/v4/companies/{company_id}",
+                    params={"with": "contacts,leads,customers,catalog_elements"},
+                ),
+            ),
         )
 
     async def get_lead_tasks(
@@ -265,7 +508,12 @@ class AmoCRMClient:
             max_items=max_items,
         )
 
-    async def get_lead_full_details(self, lead_id: int) -> dict[str, Any]:
+    async def get_lead_full_details(
+        self,
+        lead_id: int,
+        *,
+        lightweight: bool = False,
+    ) -> dict[str, Any]:
         lead = await self.get_lead(lead_id)
         embedded = lead.get("_embedded", {})
         contact_ids = [
@@ -293,18 +541,36 @@ class AmoCRMClient:
         requests = [
             collect("tasks", self.get_lead_tasks(lead_id)),
             collect("notes", self.get_lead_notes(lead_id)),
-            collect("events", self.get_lead_events(lead_id)),
             collect("pipelines", self.get_pipelines()),
-            collect("users", self.get_users()),
-            collect(
-                "contacts",
-                asyncio.gather(*(self.get_contact(item_id) for item_id in contact_ids)),
-            ),
-            collect(
-                "companies",
-                asyncio.gather(*(self.get_company(item_id) for item_id in company_ids)),
-            ),
         ]
+        if lightweight:
+            requests.extend(
+                [
+                    collect("events", asyncio.sleep(0, result=[])),
+                    collect("users", asyncio.sleep(0, result=[])),
+                    collect("contacts", asyncio.sleep(0, result=embedded.get("contacts", []))),
+                    collect("companies", asyncio.sleep(0, result=embedded.get("companies", []))),
+                ]
+            )
+        else:
+            requests.extend(
+                [
+                    collect("events", self.get_lead_events(lead_id)),
+                    collect("users", self.get_users()),
+                    collect(
+                        "contacts",
+                        asyncio.gather(
+                            *(self.get_contact(item_id) for item_id in contact_ids)
+                        ),
+                    ),
+                    collect(
+                        "companies",
+                        asyncio.gather(
+                            *(self.get_company(item_id) for item_id in company_ids)
+                        ),
+                    ),
+                ]
+            )
         related = await asyncio.gather(*requests)
         result: dict[str, Any] = {"lead": lead, "errors": {}}
         for name, value, error in related:
@@ -351,9 +617,54 @@ class AmoCRMClient:
         return await self._paginate("/api/v4/tasks", params=params, embedded_key="tasks")
 
     async def get_pipelines(self) -> list[dict[str, Any]]:
-        data = await self._request("GET", "/api/v4/leads/pipelines")
-        return data.get("_embedded", {}).get("pipelines", [])
+        async def load() -> list[dict[str, Any]]:
+            async def fetch() -> list[dict[str, Any]]:
+                data = await self._request("GET", "/api/v4/leads/pipelines")
+                return data.get("_embedded", {}).get("pipelines", [])
+
+            return await self._snapshot_cached(
+                "pipelines",
+                0,
+                self._settings.amocrm_static_cache_seconds,
+                fetch,
+            )
+
+        return await self._cached(
+            "pipelines",
+            self._settings.amocrm_static_cache_seconds,
+            load,
+        )
 
     async def get_users(self) -> list[dict[str, Any]]:
-        data = await self._request("GET", "/api/v4/users")
-        return data.get("_embedded", {}).get("users", [])
+        async def load() -> list[dict[str, Any]]:
+            async def fetch() -> list[dict[str, Any]]:
+                data = await self._request("GET", "/api/v4/users")
+                return data.get("_embedded", {}).get("users", [])
+
+            return await self._snapshot_cached(
+                "users",
+                0,
+                self._settings.amocrm_static_cache_seconds,
+                fetch,
+            )
+
+        return await self._cached(
+            "users",
+            self._settings.amocrm_static_cache_seconds,
+            load,
+        )
+
+    async def get_user_groups(self) -> list[dict[str, Any]]:
+        async def load() -> list[dict[str, Any]]:
+            data = await self._request(
+                "GET",
+                "/api/v4/account",
+                params={"with": "users_groups"},
+            )
+            return data.get("_embedded", {}).get("users_groups", [])
+
+        return await self._cached(
+            "user_groups",
+            self._settings.amocrm_static_cache_seconds,
+            load,
+        )

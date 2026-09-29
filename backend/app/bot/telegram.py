@@ -103,11 +103,11 @@ class TelegramBotService:
         self, message: Message, account: User, query: str
     ) -> None:
         if (
-            not self._settings.f5ai_api_key
-            or self._settings.f5ai_api_key == "sk-f5ai-..."
+            not self._settings.llm_api_key
+            or self._settings.llm_api_key == "sk-llm-..."
         ):
             await message.answer(
-                "F5AI API пока не настроен. Обратитесь к администратору.",
+                "LLM API пока не настроен. Обратитесь к администратору.",
                 reply_markup=main_menu_keyboard(),
             )
             return
@@ -126,6 +126,8 @@ class TelegramBotService:
                 session_id,
                 user_id=account.id,
                 user_role=account.role or "user",
+                amocrm_user_id=account.amocrm_user_id,
+                amocrm_user_name=account.name,
             )
         except RuntimeError as exc:
             await message.answer(str(exc), reply_markup=main_menu_keyboard())
@@ -179,7 +181,7 @@ class TelegramBotService:
                 await self._deny(message)
                 return
             await message.answer(
-                "Привет! Я F5 Assistant для amoCRM.\n\n"
+                "Привет! Я AI Assistant для amoCRM.\n\n"
                 "Примеры запросов:\n"
                 "• Сделай отчёт по сделкам за март\n"
                 "• Сколько новых лидов за неделю?\n"

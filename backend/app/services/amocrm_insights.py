@@ -8,11 +8,12 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import Settings
-from app.database import AmoCRMWebhookEvent, DealInsight
+from app.database import AmoCRMWebhookEvent, DealInsight, User
 from app.services.amocrm_client import AmoCRMClient
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,7 @@ class AmoCRMInsightService:
         self._session_factory = session_factory
         self._amocrm = amocrm
         self._task: asyncio.Task | None = None
+        self._refresh_tasks: dict[int, asyncio.Task] = {}
         self._stop = asyncio.Event()
 
     @property
@@ -145,6 +147,9 @@ class AmoCRMInsightService:
     def validate_webhook_secret(self, secret: str) -> bool:
         expected = self._settings.amocrm_webhook_secret
         return bool(expected) and hmac.compare_digest(secret, expected)
+
+    async def api_metrics(self) -> dict[str, Any]:
+        return await self._amocrm.coordinator_metrics()
 
     async def webhook_status(self) -> dict[str, Any]:
         destination = self.webhook_destination
@@ -170,6 +175,53 @@ class AmoCRMInsightService:
         result["registered"] = bool(current and not current.get("disabled"))
         result["webhook"] = current
         return result
+
+    async def list_managers(self) -> list[dict[str, Any]]:
+        try:
+            users = await self._amocrm.get_users()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 403:
+                raise
+            logger.warning(
+                "amoCRM denied /api/v4/users; building manager list from leads"
+            )
+            leads = await self._amocrm.get_leads(
+                with_contacts=False,
+                max_items=250,
+            )
+            async with self._session_factory() as session:
+                linked = (
+                    await session.scalars(
+                        select(User).where(User.amocrm_user_id.is_not(None))
+                    )
+                ).all()
+            names = {
+                user.amocrm_user_id: user.name
+                for user in linked
+                if user.amocrm_user_id
+            }
+            manager_ids = {
+                lead.get("responsible_user_id")
+                for lead in leads
+                if lead.get("responsible_user_id")
+            } | set(names)
+            users = [
+                {
+                    "id": manager_id,
+                    "name": names.get(manager_id) or f"Менеджер #{manager_id}",
+                }
+                for manager_id in sorted(manager_ids)
+            ]
+        return [
+            {
+                "id": user.get("id"),
+                "name": user.get("name") or f"Менеджер #{user.get('id')}",
+                "email": user.get("email"),
+                "is_active": user.get("rights", {}).get("is_active", True),
+            }
+            for user in users
+            if user.get("id")
+        ]
 
     async def register_webhook(self) -> dict[str, Any]:
         destination = self.webhook_destination
@@ -240,7 +292,10 @@ class AmoCRMInsightService:
                 if event.entity_id and event.entity_type in {
                     "leads", "lead", "message", "outgoing_message"
                 }:
-                    await self.analyze_lead(event.entity_id)
+                    if self._task:
+                        self._schedule_lead_refresh(event.entity_id)
+                    else:
+                        await self.analyze_lead(event.entity_id)
                 event.status = "processed"
                 event.processed_at = datetime.now(timezone.utc)
                 event.error = None
@@ -251,8 +306,42 @@ class AmoCRMInsightService:
                 event.processed_at = datetime.now(timezone.utc)
             await session.commit()
 
-    async def analyze_lead(self, lead_id: int) -> dict[str, Any] | None:
-        details = await self._amocrm.get_lead_full_details(lead_id)
+    def _schedule_lead_refresh(self, lead_id: int) -> None:
+        existing = self._refresh_tasks.get(lead_id)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(self._coalesced_lead_refresh(lead_id))
+        self._refresh_tasks[lead_id] = task
+        task.add_done_callback(lambda _: self._refresh_tasks.pop(lead_id, None))
+
+    async def _coalesced_lead_refresh(self, lead_id: int) -> None:
+        await asyncio.sleep(max(1, self._settings.amocrm_webhook_coalesce_seconds))
+        async with self._amocrm.priority(1):
+            await self._amocrm.invalidate_entity("lead", lead_id)
+            await self.analyze_lead(lead_id, force=True)
+
+    async def analyze_lead(
+        self,
+        lead_id: int,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any] | None:
+        now = datetime.now(timezone.utc)
+        async with self._session_factory() as session:
+            existing = await session.get(DealInsight, lead_id)
+            if not force and existing and existing.analyzed_at:
+                analyzed_at = existing.analyzed_at
+                if analyzed_at.tzinfo is None:
+                    analyzed_at = analyzed_at.replace(tzinfo=timezone.utc)
+                if (
+                    now - analyzed_at
+                ).total_seconds() < self._settings.amocrm_insight_debounce_seconds:
+                    return self._serialize_insight(existing)
+
+        details = await self._amocrm.get_lead_full_details(
+            lead_id,
+            lightweight=True,
+        )
         lead = details.get("lead") or {}
         if not lead:
             return None
@@ -274,7 +363,6 @@ class AmoCRMInsightService:
                 await session.commit()
             return None
 
-        now = datetime.now(timezone.utc)
         communication = analyze_communications(
             details.get("notes", []), details.get("events", [])
         )
@@ -419,16 +507,27 @@ class AmoCRMInsightService:
         cutoff = (datetime.now(timezone.utc) - timedelta(
             days=self._settings.forgotten_deal_days
         )).date().isoformat()
-        leads = await self._amocrm.get_leads(
-            date_to=cutoff,
-            date_field="updated_at",
-            max_items=self._settings.insight_scan_max_leads,
-        )
-        semaphore = asyncio.Semaphore(3)
+        if hasattr(self._amocrm, "priority"):
+            async with self._amocrm.priority(2):
+                leads = await self._amocrm.get_leads(
+                    date_to=cutoff,
+                    date_field="updated_at",
+                    max_items=min(self._settings.insight_scan_max_leads, 20),
+                )
+        else:
+            leads = await self._amocrm.get_leads(
+                date_to=cutoff,
+                date_field="updated_at",
+                max_items=min(self._settings.insight_scan_max_leads, 20),
+            )
+        semaphore = asyncio.Semaphore(2)
 
         async def analyze(lead: dict[str, Any]) -> dict[str, Any] | None:
             async with semaphore:
                 try:
+                    if hasattr(self._amocrm, "priority"):
+                        async with self._amocrm.priority(2):
+                            return await self.analyze_lead(int(lead["id"]))
                     return await self.analyze_lead(int(lead["id"]))
                 except Exception:
                     logger.exception("Failed to analyze lead %s", lead.get("id"))
@@ -490,6 +589,10 @@ class AmoCRMInsightService:
 
     async def stop(self) -> None:
         self._stop.set()
+        for task in self._refresh_tasks.values():
+            task.cancel()
+        await asyncio.gather(*self._refresh_tasks.values(), return_exceptions=True)
+        self._refresh_tasks.clear()
         if self._task:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)

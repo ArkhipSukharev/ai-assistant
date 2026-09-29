@@ -10,7 +10,7 @@ from app.models.schemas import BalanceResponse, ChatRequest, ChatResponse
 from app.services.agent import AgentService
 from app.services.auth_service import AuthService
 from app.services.conversation_service import ConversationService
-from app.services.f5ai_client import F5AIClient
+from app.services.llm_client import LLMClient
 
 router = APIRouter(prefix="/api", tags=["chat"])
 limiter = Limiter(key_func=get_remote_address)
@@ -34,8 +34,8 @@ async def chat(
     conversations: ConversationService = Depends(get_conversation_service),
     settings: Settings = Depends(get_settings),
 ) -> ChatResponse:
-    if not settings.f5ai_api_key or settings.f5ai_api_key == "sk-f5ai-...":
-        raise HTTPException(status_code=503, detail="F5AI API пока не настроен")
+    if not settings.llm_api_key or settings.llm_api_key == "sk-llm-...":
+        raise HTTPException(status_code=503, detail="LLM API пока не настроен")
     if not await auth.consume_request(user.id):
         raise HTTPException(status_code=429, detail="Дневной лимит запросов исчерпан")
 
@@ -61,6 +61,8 @@ async def chat(
             internal_session_id,
             user_id=user.id,
             user_role=user.role,
+            amocrm_user_id=user.amocrm_user_id,
+            amocrm_user_name=user.name,
             history_override=history,
         )
     except RuntimeError as exc:
@@ -103,11 +105,11 @@ async def get_balance(
     _: User = Depends(require_admin),
     settings: Settings = Depends(get_settings),
 ) -> BalanceResponse:
-    if not settings.f5ai_api_key:
-        raise HTTPException(status_code=503, detail="F5AI is not configured")
-    client = F5AIClient(settings)
+    if not settings.llm_api_key:
+        raise HTTPException(status_code=503, detail="LLM is not configured")
+    client = LLMClient(settings)
     try:
         balance = await client.get_balance()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch F5AI balance: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Failed to fetch LLM balance: {exc}") from exc
     return BalanceResponse(balance=balance)

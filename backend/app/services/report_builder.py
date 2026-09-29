@@ -16,14 +16,14 @@ def _parse_date(value: int | None) -> str | None:
 def _is_won(status_id: int, pipeline: dict[str, Any]) -> bool:
     for status in pipeline.get("_embedded", {}).get("statuses", []):
         if status.get("id") == status_id:
-            return status.get("type") == 142
+            return status_id == 142 or status.get("type") == 1
     return False
 
 
 def _is_lost(status_id: int, pipeline: dict[str, Any]) -> bool:
     for status in pipeline.get("_embedded", {}).get("statuses", []):
         if status.get("id") == status_id:
-            return status.get("type") == 143
+            return status_id == 143 or status.get("type") == 2
     return False
 
 
@@ -53,7 +53,11 @@ class ReportBuilder:
                 }
             )
 
-        if tool_name == "generate_sales_report":
+        if tool_name in {
+            "generate_sales_report",
+            "get_my_statistics",
+            "generate_department_sales_report",
+        }:
             summary = result.get("summary", {})
             groups = result.get("groups", {})
             add(
@@ -107,6 +111,22 @@ class ReportBuilder:
                     len(result.get(section, [])),
                     loaded.get(section, len(result.get(section, []))),
                 )
+        elif tool_name == "find_deals_with_communications":
+            summary = result.get("summary", {})
+            add(
+                "Количество найденных сделок совпадает со списком",
+                len(result.get("items", [])),
+                summary.get("deals_with_communications", 0),
+            )
+            checks.append(
+                {
+                    "name": "Найденных сделок не больше проверенных",
+                    "passed": summary.get("deals_with_communications", 0)
+                    <= summary.get("checked_deals", 0),
+                    "actual": summary.get("deals_with_communications", 0),
+                    "expected": f"≤ {summary.get('checked_deals', 0)}",
+                }
+            )
         elif tool_name in {"get_leads", "get_contacts", "get_tasks", "get_users"}:
             checks.append(
                 {
@@ -136,6 +156,96 @@ class ReportBuilder:
     def build_presentation(
         self, tool_name: str, result: dict[str, Any]
     ) -> dict[str, Any] | None:
+        if tool_name == "get_my_statistics" and not result.get("error"):
+            summary = result.get("summary", {})
+            tasks = result.get("tasks", {})
+            manager = result.get("manager", {})
+            period = result.get("period", {})
+            rows = [
+                {"stage": name, "deals": values.get("count", 0), "budget": values.get("budget", 0)}
+                for name, values in result.get("groups", {}).items()
+            ]
+            rows.sort(key=lambda row: row["budget"], reverse=True)
+            return {
+                **self._presentation_quality(result),
+                "kind": "report",
+                "title": (
+                    f"Моя статистика · {manager.get('name', '')} · "
+                    f"{period.get('from')} — {period.get('to')}"
+                ),
+                "metrics": [
+                    {"label": "Сделки", "value": summary.get("total_deals", 0), "format": "number"},
+                    {"label": "Бюджет", "value": summary.get("total_budget", 0), "format": "currency"},
+                    {"label": "Успешные", "value": summary.get("won_deals", 0), "format": "number"},
+                    {"label": "Конверсия", "value": summary.get("win_rate_percent", 0), "format": "percent"},
+                    {"label": "Задачи", "value": tasks.get("total", 0), "format": "number"},
+                    {"label": "Просрочено", "value": tasks.get("overdue", 0), "format": "number"},
+                ],
+                "table": {
+                    "columns": [
+                        {"key": "stage", "label": "Этап"},
+                        {"key": "deals", "label": "Сделки", "format": "number"},
+                        {"key": "budget", "label": "Бюджет", "format": "currency"},
+                    ],
+                    "rows": rows,
+                },
+                "chart": {
+                    "type": "bar",
+                    "title": "Бюджет по этапам",
+                    "labels": [row["stage"] for row in rows[:12]],
+                    "values": [row["budget"] for row in rows[:12]],
+                    "format": "currency",
+                },
+            }
+
+        if tool_name == "find_deals_with_communications":
+            summary = result.get("summary", {})
+            scope = result.get("scope", {})
+            title_suffix = (
+                f"{scope.get('date_from')} — {scope.get('date_to')}"
+                if scope.get("date_from") and scope.get("date_to")
+                else "выбранные сделки"
+            )
+            return {
+                **self._presentation_quality(result),
+                "kind": "report",
+                "title": (
+                    f"Коммуникации по сделкам · "
+                    f"{title_suffix}"
+                ),
+                "metrics": [
+                    {
+                        "label": "Проверено",
+                        "value": summary.get("checked_deals", 0),
+                        "format": "number",
+                    },
+                    {
+                        "label": "С коммуникациями",
+                        "value": summary.get("deals_with_communications", 0),
+                        "format": "number",
+                    },
+                ],
+                "table": {
+                    "columns": [
+                        {"key": "name", "label": "Сделка"},
+                        {"key": "calls", "label": "Звонки", "format": "number"},
+                        {
+                            "key": "messages",
+                            "label": "Сообщения",
+                            "format": "number",
+                        },
+                        {
+                            "key": "comments",
+                            "label": "Примечания",
+                            "format": "number",
+                        },
+                        {"key": "last_activity_at", "label": "Последняя активность"},
+                        {"key": "url", "label": "Ссылка"},
+                    ],
+                    "rows": result.get("items", []),
+                },
+            }
+
         if tool_name == "analyze_lead":
             deal = result.get("deal", {})
             resolved = result.get("resolved", {})
@@ -153,11 +263,18 @@ class ReportBuilder:
                 and task["complete_till"] < now_timestamp
             )
             rows = [
-                {"field": "Воронка", "value": pipeline.get("name") or deal.get("pipeline_id")},
-                {"field": "Этап", "value": status.get("name") or deal.get("status_id")},
+                {
+                    "field": "Воронка",
+                    "value": pipeline.get("name") or "Воронка не определена",
+                },
+                {
+                    "field": "Этап",
+                    "value": status.get("name") or "Статус не определён",
+                },
                 {
                     "field": "Ответственный",
-                    "value": manager.get("name") or deal.get("responsible_user_id"),
+                    "value": manager.get("name")
+                    or "Ответственный не определён",
                 },
                 {"field": "Создана", "value": _parse_date(deal.get("created_at"))},
                 {"field": "Обновлена", "value": _parse_date(deal.get("updated_at"))},
@@ -298,6 +415,74 @@ class ReportBuilder:
                 },
             }
 
+        if tool_name == "generate_department_sales_report":
+            summary = result.get("summary", {})
+            department = result.get("department", {})
+            rows = result.get("manager_breakdown", [])
+            return {
+                **self._presentation_quality(result),
+                "kind": "report",
+                "title": (
+                    f"Продажи отдела «{department.get('name', '')}»"
+                    f"{period_label}"
+                ),
+                "metrics": [
+                    {
+                        "label": "Сотрудники",
+                        "value": len(result.get("members", [])),
+                        "format": "number",
+                    },
+                    {
+                        "label": "Сделки",
+                        "value": summary.get("total_deals", 0),
+                        "format": "number",
+                    },
+                    {
+                        "label": "Бюджет",
+                        "value": summary.get("total_budget", 0),
+                        "format": "currency",
+                    },
+                    {
+                        "label": "Успешные",
+                        "value": summary.get("won_deals", 0),
+                        "format": "number",
+                    },
+                    {
+                        "label": "Конверсия",
+                        "value": summary.get("win_rate_percent", 0),
+                        "format": "percent",
+                    },
+                ],
+                "table": {
+                    "columns": [
+                        {"key": "manager_name", "label": "Менеджер"},
+                        {
+                            "key": "deals_count",
+                            "label": "Сделки",
+                            "format": "number",
+                        },
+                        {
+                            "key": "total_budget",
+                            "label": "Бюджет",
+                            "format": "currency",
+                        },
+                        {
+                            "key": "average_check",
+                            "label": "Средний чек",
+                            "format": "currency",
+                        },
+                    ],
+                    "rows": rows,
+                },
+                "chart": {
+                    "type": "bar",
+                    "title": "Бюджет по менеджерам отдела",
+                    "labels": [row["manager_name"] for row in rows],
+                    "values": [row["total_budget"] for row in rows],
+                    "format": "currency",
+                },
+            }
+
         if tool_name == "generate_funnel_report":
             rows = result.get("stages", [])
             return {
@@ -377,7 +562,12 @@ class ReportBuilder:
                 [
                     {"key": "name", "label": "Сделка"},
                     {"key": "price", "label": "Бюджет", "format": "currency"},
-                    {"key": "status_id", "label": "Статус"},
+                    {"key": "pipeline_name", "label": "Воронка"},
+                    {"key": "status_name", "label": "Статус"},
+                    {
+                        "key": "responsible_user_name",
+                        "label": "Ответственный",
+                    },
                     {"key": "created_at", "label": "Создана", "format": "timestamp"},
                 ],
             ),
@@ -385,7 +575,10 @@ class ReportBuilder:
                 "Контакты",
                 [
                     {"key": "name", "label": "Контакт"},
-                    {"key": "responsible_user_id", "label": "Ответственный ID"},
+                    {
+                        "key": "responsible_user_name",
+                        "label": "Ответственный",
+                    },
                     {"key": "created_at", "label": "Создан", "format": "timestamp"},
                 ],
             ),
@@ -394,13 +587,16 @@ class ReportBuilder:
                 [
                     {"key": "text", "label": "Задача"},
                     {"key": "complete_till", "label": "Срок", "format": "timestamp"},
-                    {"key": "responsible_user_id", "label": "Ответственный ID"},
+                    {
+                        "key": "responsible_user_name",
+                        "label": "Ответственный",
+                    },
                     {"key": "is_completed", "label": "Выполнена", "format": "boolean"},
                 ],
             ),
             "get_users": (
                 "Менеджеры",
-                [{"key": "name", "label": "Менеджер"}, {"key": "id", "label": "ID"}],
+                [{"key": "name", "label": "Менеджер"}],
             ),
         }
         if tool_name in list_tables:
@@ -427,7 +623,10 @@ class ReportBuilder:
         pipelines = pipelines or []
         users = users or []
         pipeline_map = {p["id"]: p for p in pipelines}
-        user_map = {u["id"]: u.get("name", str(u["id"])) for u in users}
+        user_map = {
+            u["id"]: u.get("name") or "Ответственный не определён"
+            for u in users
+        }
 
         total_count = len(leads)
         total_budget = sum(lead.get("price") or 0 for lead in leads)
@@ -445,7 +644,10 @@ class ReportBuilder:
                     lost_count += 1
 
             if group_by == "manager":
-                key = user_map.get(lead.get("responsible_user_id"), "unknown")
+                key = user_map.get(
+                    lead.get("responsible_user_id"),
+                    "Ответственный не определён",
+                )
             elif group_by == "day":
                 key = _parse_date(lead.get("created_at")) or "unknown"
             elif group_by == "week":
@@ -456,7 +658,7 @@ class ReportBuilder:
                 else:
                     key = "unknown"
             else:
-                status_name = str(status_id)
+                status_name = "Статус не определён"
                 if pipeline:
                     for status in pipeline.get("_embedded", {}).get("statuses", []):
                         if status.get("id") == status_id:
@@ -483,6 +685,77 @@ class ReportBuilder:
             "groups": dict(groups),
         }
 
+    def build_pipeline_breakdown(
+        self,
+        leads: list[dict[str, Any]],
+        pipelines: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        pipeline_map = {pipeline["id"]: pipeline for pipeline in pipelines}
+        result: dict[int | None, dict[str, Any]] = {}
+
+        for lead in leads:
+            pipeline_id = lead.get("pipeline_id")
+            status_id = lead.get("status_id")
+            pipeline = pipeline_map.get(pipeline_id, {})
+            statuses = pipeline.get("_embedded", {}).get("statuses", [])
+            status = next(
+                (item for item in statuses if item.get("id") == status_id),
+                {},
+            )
+            outcome = (
+                "won"
+                if pipeline and _is_won(status_id, pipeline)
+                else "lost"
+                if pipeline and _is_lost(status_id, pipeline)
+                else "active"
+            )
+            row = result.setdefault(
+                pipeline_id,
+                {
+                    "pipeline_id": pipeline_id,
+                    "pipeline_name": pipeline.get(
+                        "name", "Воронка не определена"
+                    ),
+                    "deals_count": 0,
+                    "total_budget": 0,
+                    "won_deals": 0,
+                    "lost_deals": 0,
+                    "active_deals": 0,
+                    "_stages": {},
+                },
+            )
+            row["deals_count"] += 1
+            row["total_budget"] += lead.get("price") or 0
+            row[f"{outcome}_deals"] += 1
+            stage = row["_stages"].setdefault(
+                status_id,
+                {
+                    "status_id": status_id,
+                    "status_name": status.get(
+                        "name", "Статус не определён"
+                    ),
+                    "outcome": outcome,
+                    "deals_count": 0,
+                    "total_budget": 0,
+                },
+            )
+            stage["deals_count"] += 1
+            stage["total_budget"] += lead.get("price") or 0
+
+        rows = []
+        for row in result.values():
+            closed = row["won_deals"] + row["lost_deals"]
+            row["win_rate_percent"] = (
+                round(row["won_deals"] / closed * 100, 2) if closed else 0.0
+            )
+            row["stages"] = sorted(
+                row.pop("_stages").values(),
+                key=lambda item: item["deals_count"],
+                reverse=True,
+            )
+            rows.append(row)
+        return sorted(rows, key=lambda item: item["deals_count"], reverse=True)
+
     def build_funnel_report(
         self,
         leads: list[dict[str, Any]],
@@ -498,17 +771,22 @@ class ReportBuilder:
         stage_counts = Counter()
         stage_budgets: dict[str, int] = defaultdict(int)
 
-        status_names = {s["id"]: s.get("name", str(s["id"])) for s in statuses}
+        status_names = {
+            s["id"]: s.get("name") or "Статус не определён"
+            for s in statuses
+        }
         for lead in leads:
             if lead.get("pipeline_id") != pipeline["id"]:
                 continue
-            name = status_names.get(lead.get("status_id"), "unknown")
+            name = status_names.get(
+                lead.get("status_id"), "Статус не определён"
+            )
             stage_counts[name] += 1
             stage_budgets[name] += lead.get("price") or 0
 
         ordered_stages = []
         for status in sorted(statuses, key=lambda s: s.get("sort", 0)):
-            name = status.get("name", str(status["id"]))
+            name = status.get("name") or "Статус не определён"
             count = stage_counts.get(name, 0)
             ordered_stages.append(
                 {
@@ -539,7 +817,10 @@ class ReportBuilder:
         *,
         top_n: int = 10,
     ) -> dict[str, Any]:
-        user_map = {u["id"]: u.get("name", str(u["id"])) for u in users}
+        user_map = {
+            u["id"]: u.get("name") or "Ответственный не определён"
+            for u in users
+        }
         stats: dict[int, dict[str, Any]] = defaultdict(lambda: {"count": 0, "budget": 0})
 
         for lead in leads:
@@ -554,7 +835,9 @@ class ReportBuilder:
             rows.append(
                 {
                     "manager_id": manager_id,
-                    "manager_name": user_map.get(manager_id, str(manager_id)),
+                    "manager_name": user_map.get(
+                        manager_id, "Ответственный не определён"
+                    ),
                     "deals_count": data["count"],
                     "total_budget": data["budget"],
                     "average_check": round(data["budget"] / data["count"], 2) if data["count"] else 0,

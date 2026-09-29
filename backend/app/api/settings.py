@@ -20,10 +20,10 @@ def get_app_settings_service(request: Request) -> AppSettingsService:
     return service
 
 
-def _f5ai_configured(service: AppSettingsService) -> bool:
+def _llm_configured(service: AppSettingsService) -> bool:
     return bool(
-        service.settings.f5ai_api_key
-        and service.settings.f5ai_api_key != "sk-f5ai-..."
+        service.settings.llm_api_key
+        and service.settings.llm_api_key != "sk-llm-..."
     )
 
 
@@ -35,7 +35,7 @@ async def get_model_settings(
     return AdminSettingsResponse(
         selected_model=await service.get_model_for_user(user.id, user.role),
         available_models=await service.available_models(role=user.role),
-        f5ai_configured=_f5ai_configured(service),
+        llm_configured=_llm_configured(service),
     )
 
 
@@ -54,7 +54,7 @@ async def update_model_settings(
     return AdminSettingsResponse(
         selected_model=selected_model,
         available_models=await service.available_models(role=user.role),
-        f5ai_configured=_f5ai_configured(service),
+        llm_configured=_llm_configured(service),
     )
 
 

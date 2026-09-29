@@ -1,0 +1,19 @@
+---
+description: Deploy every completed project update to the production server
+alwaysApply: true
+---
+
+# Production Deployment
+
+After every completed code or configuration update:
+
+1. Run relevant backend tests and the frontend production build.
+2. Deploy the verified update to `/opt/ai-assistant` on the production server.
+3. Preserve production `.env` files, PostgreSQL data, Redis data, Caddy data, and backups.
+4. Apply Alembic migrations and rebuild only the affected Docker services.
+5. Keep only the production backend polling Telegram; do not start a competing local backend.
+6. Verify the public site, `/health`, and `/ready` after deployment.
+7. For amoCRM integration changes, verify the registered webhook uses the public HTTPS URL.
+8. Do not report the update as complete if deployment or health checks fail.
+
+Never store SSH passwords, API keys, tokens, or production `.env` contents in Git or Cursor rules.

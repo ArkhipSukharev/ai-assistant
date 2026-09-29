@@ -22,10 +22,11 @@ from app.database import Database
 from app.services.agent import AgentService
 from app.services.amocrm_client import AmoCRMClient
 from app.services.amocrm_insights import AmoCRMInsightService
+from app.services.amocrm_snapshot import AmoCRMSnapshotStore
 from app.services.app_settings import AppSettingsService
 from app.services.auth_service import AuthService
 from app.services.conversation_service import ConversationService
-from app.services.f5ai_client import F5AIClient
+from app.services.llm_client import LLMClient
 from app.services.report_schedule import ReportScheduleService
 from app.services.session_store import SessionStore
 from app.services.telegram_proxy import TelegramProxyService
@@ -57,9 +58,13 @@ async def lifespan(app: FastAPI):
     app.state.auth_service = auth_service
     app.state.conversation_service = conversation_service
 
-    f5ai = F5AIClient(settings)
-    amocrm = AmoCRMClient(settings)
-    app_settings_service = AppSettingsService(database, settings, f5ai)
+    llm = LLMClient(settings)
+    amocrm = AmoCRMClient(
+        settings,
+        AmoCRMSnapshotStore(database.session_factory),
+    )
+    await amocrm.start()
+    app_settings_service = AppSettingsService(database, settings, llm)
     telegram_proxy_service = TelegramProxyService(database, settings)
     amocrm_insight_service = AmoCRMInsightService(
         settings, database.session_factory, amocrm
@@ -69,7 +74,7 @@ async def lifespan(app: FastAPI):
     app.state.amocrm_insight_service = amocrm_insight_service
     agent = AgentService(
         settings,
-        f5ai,
+        llm,
         amocrm,
         session_store,
         app_settings_service,
@@ -101,6 +106,7 @@ async def lifespan(app: FastAPI):
     await amocrm_insight_service.stop()
     await report_schedule_service.stop()
     await telegram_manager.stop()
+    await amocrm.close()
 
     if session_store:
         await session_store.close()
@@ -112,7 +118,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="F5 Assistant", lifespan=lifespan)
+    app = FastAPI(title="AI Assistant", lifespan=lifespan)
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 

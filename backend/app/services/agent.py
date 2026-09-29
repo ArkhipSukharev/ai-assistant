@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import httpx
 
 from app.config import Settings
 from app.models.schemas import ChatAttachment
 from app.services.amocrm_client import AmoCRMClient
+from app.services.amocrm_coordinator import AmoCRMCircuitOpen
 from app.services.amocrm_insights import AmoCRMInsightService, analyze_communications
 from app.services.app_settings import AppSettingsService
-from app.services.f5ai_client import F5AIClient
+from app.services.llm_client import LLMClient
 from app.services.report_builder import ReportBuilder
 from app.services.session_store import SessionStore
 from app.tools.amocrm_tools import AMOCRM_TOOLS, SYSTEM_INSTRUCTIONS
@@ -32,13 +38,78 @@ def _wants_csv(message: str) -> bool:
     )
 
 
+def _wants_visualization(message: str) -> bool:
+    normalized = message.casefold()
+    if _blocks_visualization(message):
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "график",
+            "диаграм",
+            "таблиц",
+            "визуализ",
+            "карточк",
+            "дашборд",
+            "в виде схем",
+        )
+    )
+
+
+def _blocks_visualization(message: str) -> bool:
+    normalized = message.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "без визуализац",
+            "без график",
+            "без диаграм",
+            "без таблиц",
+            "не делай график",
+            "не строй график",
+            "не показывай график",
+            "не добавляй визуализац",
+        )
+    )
+
+
+def _should_auto_table(message: str, presentation: dict[str, Any]) -> bool:
+    if _blocks_visualization(message):
+        return False
+    rows = presentation.get("table", {}).get("rows", [])
+    return 2 <= len(rows) <= 20
+
+
 def _clean_assistant_content(content: str) -> str:
+    replacements = {
+        "communication_analysis": "анализ коммуникаций",
+        "analyze_lead": "детальный анализ сделки",
+        "find_forgotten_deals": "анализ сделок без активности",
+        "find_deals_with_communications": "анализ коммуникаций по сделкам",
+        "generate_department_sales_report": "отчёт по отделу",
+        "get_leads": "данные о сделках",
+        "TOOL_RESULT": "данные amoCRM",
+    }
+    for internal_name, public_name in replacements.items():
+        content = content.replace(internal_name, public_name)
+    content = re.sub(
+        r"(https://[^/\s]+)/(?:api/v4/)?leads/(\d+)",
+        r"\1/leads/detail/\2",
+        content,
+    )
     lines = []
     for line in content.splitlines():
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = re.sub(r"^\s*\*\s+", "— ", line)
+        line = line.replace("**", "").replace("*", "")
         stripped = line.strip()
         if (
             stripped.startswith("Получаю данные amoCRM через ")
             and stripped.endswith(".")
+        ):
+            continue
+        if stripped.casefold().startswith("если нужна") and (
+            "уточните" in stripped.casefold() or "могу" in stripped.casefold()
         ):
             continue
         lines.append(line)
@@ -49,6 +120,33 @@ def _default_period() -> tuple[str, str]:
     today = datetime.now(MOSCOW_TIMEZONE).date()
     start = today.replace(day=1)
     return start.isoformat(), today.isoformat()
+
+
+def _normalize_person_or_group_name(value: str) -> str:
+    words = re.findall(r"[a-zа-яё0-9]+", value.casefold())
+    return " ".join(sorted(words))
+
+
+def _resolve_group_by_name(
+    requested_name: str,
+    groups: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    target = _normalize_person_or_group_name(requested_name)
+    if not target:
+        return None
+    scored = []
+    for group in groups:
+        normalized = _normalize_person_or_group_name(str(group.get("name") or ""))
+        if not normalized:
+            continue
+        score = 1.0 if normalized == target else SequenceMatcher(
+            None, target, normalized
+        ).ratio()
+        scored.append((score, group))
+    if not scored:
+        return None
+    score, group = max(scored, key=lambda item: item[0])
+    return group if score >= 0.72 else None
 
 
 def _instructions_with_current_time(now: datetime | None = None) -> str:
@@ -62,7 +160,29 @@ def _instructions_with_current_time(now: datetime | None = None) -> str:
     )
 
 
-def _compact_leads(leads: list[dict[str, Any]], limit: int = 20) -> dict[str, Any]:
+def _compact_leads(
+    leads: list[dict[str, Any]],
+    pipelines: list[dict[str, Any]] | None = None,
+    users: list[dict[str, Any]] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    pipeline_names = {
+        pipeline.get("id"): pipeline.get("name") for pipeline in pipelines or []
+    }
+    status_names = {
+        status.get("id"): status.get("name")
+        for pipeline in pipelines or []
+        for status in pipeline.get("_embedded", {}).get("statuses", [])
+    }
+    user_names = {user.get("id"): user.get("name") for user in users or []}
+
+    def format_timestamp(value: Any) -> str | None:
+        if not isinstance(value, (int, float)):
+            return None
+        return datetime.fromtimestamp(value, MOSCOW_TIMEZONE).isoformat(
+            timespec="seconds"
+        )
+
     return {
         "total": len(leads),
         "items": [
@@ -71,16 +191,32 @@ def _compact_leads(leads: list[dict[str, Any]], limit: int = 20) -> dict[str, An
                 "name": lead.get("name"),
                 "price": lead.get("price"),
                 "status_id": lead.get("status_id"),
+                "status_name": status_names.get(lead.get("status_id"))
+                or "Статус не определён",
                 "pipeline_id": lead.get("pipeline_id"),
+                "pipeline_name": pipeline_names.get(lead.get("pipeline_id"))
+                or "Воронка не определена",
                 "responsible_user_id": lead.get("responsible_user_id"),
+                "responsible_user_name": user_names.get(
+                    lead.get("responsible_user_id")
+                )
+                or "Ответственный не определён",
                 "created_at": lead.get("created_at"),
+                "created_at_iso": format_timestamp(lead.get("created_at")),
+                "updated_at_iso": format_timestamp(lead.get("updated_at")),
+                "closed_at_iso": format_timestamp(lead.get("closed_at")),
             }
             for lead in leads[:limit]
         ],
     }
 
 
-def _compact_contacts(contacts: list[dict[str, Any]], limit: int = 20) -> dict[str, Any]:
+def _compact_contacts(
+    contacts: list[dict[str, Any]],
+    users: list[dict[str, Any]] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    user_names = {user.get("id"): user.get("name") for user in users or []}
     return {
         "total": len(contacts),
         "items": [
@@ -88,6 +224,10 @@ def _compact_contacts(contacts: list[dict[str, Any]], limit: int = 20) -> dict[s
                 "id": contact.get("id"),
                 "name": contact.get("name"),
                 "responsible_user_id": contact.get("responsible_user_id"),
+                "responsible_user_name": user_names.get(
+                    contact.get("responsible_user_id")
+                )
+                or "Ответственный не определён",
                 "created_at": contact.get("created_at"),
             }
             for contact in contacts[:limit]
@@ -95,7 +235,12 @@ def _compact_contacts(contacts: list[dict[str, Any]], limit: int = 20) -> dict[s
     }
 
 
-def _compact_tasks(tasks: list[dict[str, Any]], limit: int = 20) -> dict[str, Any]:
+def _compact_tasks(
+    tasks: list[dict[str, Any]],
+    users: list[dict[str, Any]] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    user_names = {user.get("id"): user.get("name") for user in users or []}
     return {
         "total": len(tasks),
         "items": [
@@ -104,6 +249,10 @@ def _compact_tasks(tasks: list[dict[str, Any]], limit: int = 20) -> dict[str, An
                 "text": task.get("text"),
                 "complete_till": task.get("complete_till"),
                 "responsible_user_id": task.get("responsible_user_id"),
+                "responsible_user_name": user_names.get(
+                    task.get("responsible_user_id")
+                )
+                or "Ответственный не определён",
                 "is_completed": task.get("is_completed"),
             }
             for task in tasks[:limit]
@@ -254,6 +403,22 @@ class ToolExecutor:
         self._report_builder = report_builder
         self._insights = insights
 
+    async def _users_or_empty(self) -> list[dict[str, Any]]:
+        try:
+            return await self._amocrm.get_users()
+        except AmoCRMCircuitOpen:
+            logger.warning(
+                "amoCRM manager directory unavailable while circuit is open"
+            )
+            return []
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 403:
+                raise
+            logger.warning(
+                "amoCRM denied /api/v4/users; continuing without manager names"
+            )
+            return []
+
     def _finalize(
         self,
         tool_name: str,
@@ -295,7 +460,73 @@ class ToolExecutor:
         }
         return result
 
-    async def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        amocrm_user_id: int | None = None,
+        amocrm_user_name: str | None = None,
+    ) -> dict[str, Any]:
+        if name == "get_my_statistics":
+            if not amocrm_user_id:
+                return {
+                    "error": "К аккаунту не привязан менеджер amoCRM",
+                    "action": "Администратор должен выбрать менеджера в настройках аккаунта",
+                }
+            date_from = arguments.get("date_from")
+            date_to = arguments.get("date_to")
+            if not date_from or not date_to:
+                date_from, date_to = _default_period()
+            leads = await self._amocrm.get_leads(
+                date_from=date_from,
+                date_to=date_to,
+                manager_id=amocrm_user_id,
+            )
+            pipelines = await self._amocrm.get_pipelines()
+            tasks = await self._amocrm.get_tasks(
+                date_from=date_from,
+                date_to=date_to,
+                responsible_user_id=amocrm_user_id,
+            )
+            report = self._report_builder.build_sales_report(
+                leads,
+                group_by="status",
+                pipelines=pipelines,
+                users=[],
+            )
+            now_timestamp = int(datetime.now(MOSCOW_TIMEZONE).timestamp())
+            result = {
+                "period": {"from": date_from, "to": date_to},
+                "manager": {
+                    "id": amocrm_user_id,
+                    "name": amocrm_user_name or f"Менеджер #{amocrm_user_id}",
+                },
+                **report,
+                "tasks": {
+                    "total": len(tasks),
+                    "completed": sum(1 for task in tasks if task.get("is_completed")),
+                    "open": sum(1 for task in tasks if not task.get("is_completed")),
+                    "overdue": sum(
+                        1
+                        for task in tasks
+                        if not task.get("is_completed")
+                        and task.get("complete_till")
+                        and task["complete_till"] < now_timestamp
+                    ),
+                },
+            }
+            entities = [
+                ("lead", lead.get("id"), lead.get("name")) for lead in leads
+            ]
+            return self._finalize(
+                name,
+                result,
+                record_count=len(leads),
+                entities=entities,
+                truncated=len(leads) > 20,
+            )
+
         if name == "find_forgotten_deals":
             if not self._insights:
                 return {"error": "Сервис рекомендаций недоступен"}
@@ -316,6 +547,89 @@ class ToolExecutor:
                 truncated=len(items) >= arguments.get("limit", 20),
             )
 
+        if name == "find_deals_with_communications":
+            max_deals = min(max(int(arguments.get("max_deals", 10)), 1), 10)
+            lead_ids = list(
+                dict.fromkeys(
+                    int(value) for value in arguments.get("lead_ids", []) if value
+                )
+            )[:max_deals]
+            if lead_ids:
+                leads = await asyncio.gather(
+                    *(self._amocrm.get_lead(lead_id) for lead_id in lead_ids)
+                )
+                date_from = None
+                date_to = None
+            else:
+                date_from = arguments.get("date_from")
+                date_to = arguments.get("date_to")
+                if not date_from or not date_to:
+                    date_from, date_to = _default_period()
+                leads = await self._amocrm.get_leads(
+                    date_from=date_from,
+                    date_to=date_to,
+                    max_items=max_deals + 1,
+                )
+            checked_leads = leads[:max_deals]
+            items: list[dict[str, Any]] = []
+            errors: dict[str, str] = {}
+
+            async def inspect(lead: dict[str, Any]) -> None:
+                lead_id = int(lead["id"])
+                try:
+                    notes, events = await asyncio.gather(
+                        self._amocrm.get_lead_notes(lead_id),
+                        self._amocrm.get_lead_events(lead_id),
+                    )
+                    communication = analyze_communications(notes, events)
+                    if any(
+                        communication.get(section, {}).get("total", 0)
+                        for section in ("calls", "messages", "comments")
+                    ):
+                        items.append(
+                            {
+                                "lead_id": lead_id,
+                                "name": lead.get("name") or f"Сделка #{lead_id}",
+                                "calls": communication["calls"]["total"],
+                                "messages": communication["messages"]["total"],
+                                "comments": communication["comments"]["total"],
+                                "last_activity_at": communication.get(
+                                    "last_activity_at"
+                                ),
+                                "url": self._amocrm.entity_url("lead", lead_id),
+                            }
+                        )
+                except Exception as exc:
+                    errors[str(lead_id)] = str(exc)[:500]
+
+            await asyncio.gather(*(inspect(lead) for lead in checked_leads))
+            items.sort(
+                key=lambda item: item.get("last_activity_at") or "",
+                reverse=True,
+            )
+            result = {
+                "scope": (
+                    {"lead_ids": lead_ids}
+                    if lead_ids
+                    else {"date_from": date_from, "date_to": date_to}
+                ),
+                "summary": {
+                    "checked_deals": len(checked_leads),
+                    "deals_with_communications": len(items),
+                },
+                "items": items,
+                "partial_load_errors": errors,
+            }
+            return self._finalize(
+                name,
+                result,
+                record_count=len(items),
+                entities=[
+                    ("lead", item["lead_id"], item["name"]) for item in items
+                ],
+                truncated=not lead_ids and len(leads) > max_deals,
+            )
+
         if name == "analyze_lead":
             details = await self._amocrm.get_lead_full_details(arguments["lead_id"])
             result = _prepare_lead_analysis(details)
@@ -333,7 +647,22 @@ class ToolExecutor:
 
         if name == "get_leads":
             leads = await self._amocrm.get_leads(**arguments)
-            result = _compact_leads(leads)
+            if leads:
+                pipelines, users = await asyncio.gather(
+                    self._amocrm.get_pipelines(),
+                    self._users_or_empty(),
+                )
+            else:
+                pipelines, users = [], []
+            result = {
+                **_compact_leads(leads, pipelines, users),
+                "summary": {"total_deals": len(leads)},
+                "applied_filters": {
+                    key: value
+                    for key, value in arguments.items()
+                    if value is not None
+                },
+            }
             entities = [
                 ("lead", lead.get("id"), lead.get("name"))
                 for lead in leads
@@ -350,7 +679,8 @@ class ToolExecutor:
 
         if name == "get_contacts":
             contacts = await self._amocrm.get_contacts(**arguments)
-            result = _compact_contacts(contacts)
+            users = await self._users_or_empty() if contacts else []
+            result = _compact_contacts(contacts, users)
             entities = [
                 ("contact", contact.get("id"), contact.get("name"))
                 for contact in contacts
@@ -367,7 +697,8 @@ class ToolExecutor:
 
         if name == "get_tasks":
             tasks = await self._amocrm.get_tasks(**arguments)
-            result = _compact_tasks(tasks)
+            users = await self._users_or_empty() if tasks else []
+            result = _compact_tasks(tasks, users)
             return self._finalize(name, result, record_count=len(tasks))
 
         if name == "get_pipelines":
@@ -389,12 +720,92 @@ class ToolExecutor:
             return self._finalize(name, result, record_count=len(pipelines))
 
         if name == "get_users":
-            users = await self._amocrm.get_users()
+            users = await self._users_or_empty()
             result = {
                 "total": len(users),
                 "items": [{"id": user.get("id"), "name": user.get("name")} for user in users],
             }
             return self._finalize(name, result, record_count=len(users))
+
+        if name == "generate_department_sales_report":
+            date_from = arguments.get("date_from")
+            date_to = arguments.get("date_to")
+            if not date_from or not date_to:
+                date_from, date_to = _default_period()
+            requested_name = str(arguments.get("department_name") or "").strip()
+            groups, users = await asyncio.gather(
+                self._amocrm.get_user_groups(),
+                self._users_or_empty(),
+            )
+            department = _resolve_group_by_name(requested_name, groups)
+            if not department:
+                return {
+                    "error": f"Отдел «{requested_name}» не найден",
+                    "available_departments": [
+                        group.get("name") for group in groups[:50] if group.get("name")
+                    ],
+                }
+
+            department_id = department.get("id")
+            members = [
+                user
+                for user in users
+                if str((user.get("rights") or {}).get("group_id"))
+                == str(department_id)
+            ]
+            member_ids = {
+                int(user["id"]) for user in members if user.get("id") is not None
+            }
+            leads = await self._amocrm.get_leads(
+                date_from=date_from,
+                date_to=date_to,
+                manager_ids=sorted(member_ids),
+            )
+            pipelines = await self._amocrm.get_pipelines()
+            report = self._report_builder.build_sales_report(
+                leads,
+                group_by="status",
+                pipelines=pipelines,
+                users=users,
+            )
+            manager_report = self._report_builder.build_manager_report(
+                leads,
+                users,
+                top_n=max(len(members), 1),
+            )
+            result = {
+                "period": {"from": date_from, "to": date_to},
+                "selection": {
+                    "date_field": "created_at",
+                    "date_field_label": "дата создания сделки",
+                    "pipelines": "all",
+                },
+                "department": {
+                    "id": department_id,
+                    "name": department.get("name"),
+                },
+                "members": [
+                    {"id": user.get("id"), "name": user.get("name")}
+                    for user in members
+                ],
+                **report,
+                "manager_breakdown": manager_report.get("top_managers", []),
+                "pipeline_breakdown": (
+                    self._report_builder.build_pipeline_breakdown(
+                        leads,
+                        pipelines,
+                    )
+                ),
+            }
+            return self._finalize(
+                name,
+                result,
+                record_count=len(leads),
+                entities=[
+                    ("lead", lead.get("id"), lead.get("name")) for lead in leads
+                ],
+                truncated=len(leads) > 20,
+            )
 
         if name == "generate_sales_report":
             date_from = arguments.get("date_from")
@@ -409,7 +820,11 @@ class ToolExecutor:
                 manager_id=arguments.get("manager_id"),
             )
             pipelines = await self._amocrm.get_pipelines()
-            users = await self._amocrm.get_users()
+            users = (
+                await self._users_or_empty()
+                if arguments.get("group_by") == "manager"
+                else []
+            )
             report = self._report_builder.build_sales_report(
                 leads,
                 group_by=arguments.get("group_by", "status"),
@@ -464,7 +879,7 @@ class ToolExecutor:
                 date_from, date_to = _default_period()
 
             leads = await self._amocrm.get_leads(date_from=date_from, date_to=date_to)
-            users = await self._amocrm.get_users()
+            users = await self._users_or_empty()
             report = self._report_builder.build_manager_report(
                 leads,
                 users,
@@ -493,14 +908,14 @@ class AgentService:
     def __init__(
         self,
         settings: Settings,
-        f5ai: F5AIClient,
+        llm: LLMClient,
         amocrm: AmoCRMClient,
         sessions: SessionStore,
         app_settings: AppSettingsService,
         insights: AmoCRMInsightService | None = None,
     ) -> None:
         self._settings = settings
-        self._f5ai = f5ai
+        self._llm = llm
         self._amocrm = amocrm
         self._sessions = sessions
         self._app_settings = app_settings
@@ -514,10 +929,46 @@ class AgentService:
         *,
         user_id: int = 0,
         user_role: str = "user",
+        amocrm_user_id: int | None = None,
+        amocrm_user_name: str | None = None,
         history_override: list[dict[str, Any]] | None = None,
     ) -> tuple[str, str, list[ChatAttachment]]:
-        if not self._settings.f5ai_api_key:
-            raise RuntimeError("F5AI API key is not configured")
+        if not hasattr(self._amocrm, "request_budget"):
+            return await self._chat_impl(
+                message,
+                session_id,
+                user_id=user_id,
+                user_role=user_role,
+                amocrm_user_id=amocrm_user_id,
+                amocrm_user_name=amocrm_user_name,
+                history_override=history_override,
+            )
+        async with self._amocrm.request_budget(
+            self._settings.amocrm_chat_request_budget
+        ):
+            return await self._chat_impl(
+                message,
+                session_id,
+                user_id=user_id,
+                user_role=user_role,
+                amocrm_user_id=amocrm_user_id,
+                amocrm_user_name=amocrm_user_name,
+                history_override=history_override,
+            )
+
+    async def _chat_impl(
+        self,
+        message: str,
+        session_id: str | None = None,
+        *,
+        user_id: int = 0,
+        user_role: str = "user",
+        amocrm_user_id: int | None = None,
+        amocrm_user_name: str | None = None,
+        history_override: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, str, list[ChatAttachment]]:
+        if not self._settings.llm_api_key:
+            raise RuntimeError("LLM API key is not configured")
         if not self._settings.amocrm_configured:
             raise RuntimeError("amoCRM is not configured")
 
@@ -539,9 +990,14 @@ class AgentService:
             else await self._app_settings.get_model()
         )
         runtime_instructions = _instructions_with_current_time()
+        runtime_instructions += (
+            "\nМенеджер amoCRM текущего пользователя привязан к аккаунту."
+            if amocrm_user_id
+            else "\nК текущему аккаунту не привязан менеджер amoCRM."
+        )
 
         for _ in range(self.MAX_ITERATIONS):
-            response = await self._f5ai.chat_completion(
+            response = await self._llm.chat_completion(
                 messages=_compact_history(history),
                 tools=AMOCRM_TOOLS,
                 instructions=runtime_instructions,
@@ -576,13 +1032,28 @@ class AgentService:
                     executed_tool_calls += 1
                     new_tool_results += 1
                     logger.info("Executing tool %s with args %s", tool_name, arguments)
-                    result = await self._tool_executor.execute(tool_name, arguments)
+                    result = await self._tool_executor.execute(
+                        tool_name,
+                        arguments,
+                        amocrm_user_id=amocrm_user_id,
+                        amocrm_user_name=amocrm_user_name,
+                    )
                     presentation = self._report_builder.build_presentation(
                         tool_name, result
                     )
-                    if presentation:
+                    explicit_visualization = _wants_visualization(message)
+                    automatic_table = bool(
+                        presentation
+                        and _should_auto_table(message, presentation)
+                    )
+                    if presentation and (
+                        explicit_visualization or automatic_table
+                    ):
+                        rendered_presentation = dict(presentation)
+                        if automatic_table and not explicit_visualization:
+                            rendered_presentation.pop("chart", None)
                         presentation_content = json.dumps(
-                            presentation, ensure_ascii=False
+                            rendered_presentation, ensure_ascii=False
                         )
                         presentation_key = (
                             REPORT_CONTENT_TYPE,
@@ -597,20 +1068,20 @@ class AgentService:
                                 )
                             )
                             attachment_keys.add(presentation_key)
-                        if _wants_csv(message) and presentation.get("table"):
-                            csv_content = self._report_builder.table_to_csv(
-                                presentation["table"]
-                            )
-                            csv_key = ("text/csv", csv_content)
-                            if csv_key not in attachment_keys:
-                                attachments.append(
-                                    ChatAttachment(
-                                        filename="report.csv",
-                                        content_type="text/csv",
-                                        content=csv_content,
-                                    )
+                    if presentation and _wants_csv(message) and presentation.get("table"):
+                        csv_content = self._report_builder.table_to_csv(
+                            presentation["table"]
+                        )
+                        csv_key = ("text/csv", csv_content)
+                        if csv_key not in attachment_keys:
+                            attachments.append(
+                                ChatAttachment(
+                                    filename="report.csv",
+                                    content_type="text/csv",
+                                    content=csv_content,
                                 )
-                                attachment_keys.add(csv_key)
+                            )
+                            attachment_keys.add(csv_key)
 
                     history.append(
                         {
@@ -645,7 +1116,7 @@ class AgentService:
                             ),
                         },
                     ]
-                    final_response = await self._f5ai.chat_completion(
+                    final_response = await self._llm.chat_completion(
                         messages=_compact_history(final_history),
                         tools=None,
                         instructions=runtime_instructions,

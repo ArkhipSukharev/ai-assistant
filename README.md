@@ -1,6 +1,6 @@
-# F5 Assistant
+# AI Assistant
 
-AI-ассистент для amoCRM с двумя интерфейсами: **Telegram-бот** и **веб-чат**. Система использует [F5AI API](https://f5ai.ru/docs/quickstart) с function calling для получения данных из amoCRM и формирования отчётов на естественном языке.
+AI-ассистент для amoCRM с двумя интерфейсами: **Telegram-бот** и **веб-чат**. Система использует OpenAI-compatible LLM API с function calling для получения данных из amoCRM и формирования отчётов на естественном языке.
 
 ## Возможности
 
@@ -27,7 +27,7 @@ AI-ассистент для amoCRM с двумя интерфейсами: **Te
 
 ```
 Telegram Bot ──┐
-               ├──> FastAPI Agent ──> F5AI (gpt-4.1-mini)
+               ├──> FastAPI Agent ──> LLM (gpt-4.1-mini)
 Web Chat UI ───┘              └──> amoCRM API v4
 ```
 
@@ -43,7 +43,8 @@ cp backend/.env.example backend/.env
 
 | Переменная | Описание |
 |------------|----------|
-| `F5AI_API_KEY` | Ключ из [app.f5ai.ru/keys](https://app.f5ai.ru/keys/) |
+| `LLM_API_KEY` | Ключ LLM API |
+| `LLM_BASE_URL` | Базовый URL OpenAI-compatible API |
 | `AMOCRM_DOMAIN` | Домен аккаунта, например `company.amocrm.ru` |
 | `AMOCRM_ACCESS_TOKEN` | Долгоживущий токен или access token |
 | `TELEGRAM_BOT_TOKEN` | Токен от @BotFather |
@@ -96,7 +97,7 @@ docker compose logs --tail=100 backend
 ```bash
 cd backend
 python scripts/migrate_sqlite_to_postgres.py \
-  --postgres-url "postgresql+asyncpg://f5_assistant:PASSWORD@localhost:5432/f5_assistant"
+  --postgres-url "postgresql+asyncpg://ai_assistant:PASSWORD@localhost:5432/ai_assistant"
 ```
 
 Передача `--force` разрешает заменить уже существующие прикладные данные.
@@ -136,7 +137,7 @@ alembic upgrade head
 
 ### GET /api/balance
 
-Баланс F5AI аккаунта.
+Баланс аккаунта модели.
 
 ### DELETE /api/chat/{session_id}
 
@@ -166,7 +167,7 @@ alembic upgrade head
 - настраивать HTTP/SOCKS5-прокси Telegram и проверять соединение;
 - блокировать доступ;
 - устанавливать дневной лимит запросов;
-- выбирать общую модель F5AI для сайта и Telegram-бота;
+- выбирать общую модель для сайта и Telegram-бота;
 - просматривать журнал действий.
 
 Самостоятельная регистрация отключена.
@@ -202,7 +203,7 @@ INSIGHT_SCAN_MAX_LEADS=100
 оперативно. Аудиозапись звонка не расшифровывается: анализируются доступные
 amoCRM метаданные, длительность, результат и ссылка на запись.
 
-## Модель F5AI
+## Модель
 
 - Основная: `gpt-4.1-mini` — function calling, отчёты
 - Сложные запросы (>500 символов): `gpt-4o`
@@ -230,7 +231,7 @@ backend/
   app/
     api/          # REST endpoints
     bot/          # Telegram bot
-    services/     # F5AI, amoCRM, agent, reports
+    services/     # LLM, amoCRM, agent, reports
     tools/        # Function calling schemas
 frontend/web-chat/  # React UI
 docker-compose.yml

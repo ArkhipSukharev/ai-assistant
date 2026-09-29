@@ -118,7 +118,7 @@ def render_xlsx(presentation: dict[str, Any]) -> bytes:
 def _pdf_font() -> str:
     for path in FONT_PATHS:
         if path.exists():
-            name = "F5ReportFont"
+            name = "ReportFont"
             if name not in pdfmetrics.getRegisteredFontNames():
                 pdfmetrics.registerFont(TTFont(name, str(path)))
             return name

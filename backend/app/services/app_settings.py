@@ -14,9 +14,9 @@ from app.database import (
     UserQuickActions,
     UserModelPreference,
 )
-from app.services.f5ai_client import F5AIClient
+from app.services.llm_client import LLMClient
 
-MODEL_SETTING_KEY = "f5ai_model"
+MODEL_SETTING_KEY = "llm_model"
 MODEL_CODE_PATTERN = re.compile(r"^[A-Za-z0-9._:/-]{1,100}$")
 
 FALLBACK_MODELS = [
@@ -72,18 +72,18 @@ def is_light_model(model_code: str) -> bool:
 
 class AppSettingsService:
     def __init__(
-        self, database: Database, settings: Settings, f5ai: F5AIClient
+        self, database: Database, settings: Settings, llm: LLMClient
     ) -> None:
         self.database = database
         self.settings = settings
-        self.f5ai = f5ai
+        self.llm = llm
 
     async def get_model(self) -> str:
         async with self.database.session_factory() as session:
             value = await session.scalar(
                 select(AppSetting.value).where(AppSetting.key == MODEL_SETTING_KEY)
             )
-            return value or self.settings.f5ai_model
+            return value or self.settings.llm_model
 
     async def get_model_for_user(self, user_id: int, role: str) -> str:
         async with self.database.session_factory() as session:
@@ -94,7 +94,7 @@ class AppSettingsService:
             default_model = await session.scalar(
                 select(AppSetting.value).where(AppSetting.key == MODEL_SETTING_KEY)
             )
-        default_model = default_model or self.settings.f5ai_model
+        default_model = default_model or self.settings.llm_model
         if role != "admin" and not is_light_model(default_model):
             return FALLBACK_MODELS[0]["code"]
         return default_model
@@ -213,13 +213,13 @@ class AppSettingsService:
         return [dict(item) for item in DEFAULT_QUICK_ACTIONS]
 
     async def available_models(self, role: str = "admin") -> list[dict[str, Any]]:
-        if not self.settings.f5ai_api_key or self.settings.f5ai_api_key == "sk-f5ai-...":
+        if not self.settings.llm_api_key or self.settings.llm_api_key == "sk-llm-...":
             models = FALLBACK_MODELS
             if role == "admin":
                 return models
             return [item for item in models if item["is_light"]]
         try:
-            response = await self.f5ai.list_models()
+            response = await self.llm.list_models()
             models = []
             for code, item in response.items():
                 if not isinstance(item, dict) or not item.get("available", True):
